@@ -1,0 +1,23 @@
+# ============================================================
+# Crypto Trading Bot V3 - Dépendances Python
+# ============================================================
+
+# --- Asynchrone ---
+aiohttp>=3.9.0               # Requêtes HTTP asynchrones
+
+# --- Connexion aux exchanges & données de marché ---
+ccxt>=4.4.0                  # Librairie API crypto avec support asynchrone
+
+# --- Analyse technique ---
+pandas>=2.2.0                # Manipulation de données tabulaires
+ta>=0.11.0                   # Indicateurs techniques (RSI, EMA, MACD, etc.)
+
+# --- Intelligence Artificielle (Mistral) ---
+mistralai>=1.6.0             # Client officiel Mistral AI (qui supporte l'async)
+
+# --- Scraping & Actualités ---
+beautifulsoup4>=4.12.0       # Parsing HTML
+lxml>=5.0.0                  # Parser XML pour Google News RSS
+
+# --- Configuration ---
+python-dotenv>=1.1.0         # Chargement des variables d'environnement (.env)

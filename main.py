@@ -48,13 +48,15 @@ load_dotenv()
 PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
 
 # --- Clés API ---
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
-BINANCE_SECRET = os.getenv("BINANCE_SECRET", "")
+KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
+KRAKEN_SECRET = os.getenv("KRAKEN_SECRET", "")
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
+
+BOT_START_TIME = time.time()
 
 # --- Paramètres de trading ---
 CONVICTION_THRESHOLD = int(os.getenv("CONVICTION_THRESHOLD", "60"))
@@ -63,8 +65,9 @@ MAX_USDT_PER_POSITION = float(os.getenv("MAX_USDT_PER_POSITION", "25.0"))
 PORTFOLIO_FILE = "portfolio.json"
 
 WATCHLIST = [
-    "SOL/USDT", "AVAX/USDT", "INJ/USDT", "FET/USDT", "SUI/USDT",
-    "NEAR/USDT", "RENDER/USDT", "PEPE/USDT", "WIF/USDT", "ARB/USDT",
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT", "INJ/USDT",
+    "FET/USDT", "SUI/USDT", "NEAR/USDT", "RENDER/USDT", "PEPE/USDT",
+    "WIF/USDT", "ARB/USDT", "LINK/USDT", "DOGE/USDT", "MATIC/USDT", "ADA/USDT"
 ]
 TIMEFRAMES = ["1h", "4h"]
 
@@ -159,6 +162,25 @@ async def get_news_google(token: str, session: aiohttp.ClientSession) -> list[st
     except Exception:
         return []
 
+async def get_whale_alerts() -> list[str]:
+    """Récupère les derniers mouvements de baleines via RSS ou API publique."""
+    url = "https://cointelegraph.com/rss"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                xml = await resp.text()
+                soup = BeautifulSoup(xml, "xml")
+                alerts = []
+                for item in soup.find_all("item")[:20]:
+                    title = item.find("title").get_text(strip=True)
+                    t_low = title.lower()
+                    if "whale" in t_low or "transfer" in t_low or "move" in t_low or "accumulat" in t_low:
+                        alerts.append(title)
+                return alerts[:3] if alerts else ["Aucun mouvement majeur de baleine détecté récemment."]
+    except Exception as e:
+        log.warning(f"Erreur Whale Alerts: {e}")
+        return ["Impossible de récupérer les alertes de baleines."]
+
 async def get_news(symbol: str) -> list[str]:
     token = extract_token_name(symbol)
     async with aiohttp.ClientSession() as session:
@@ -230,7 +252,7 @@ async def get_technical_data(exchange: ccxt_async.Exchange, symbol: str) -> dict
 MISTRAL_PROMPT = """Tu es un algorithme de trading institutionnel.
 Analyse les données et retourne EXACTEMENT CE JSON avec le Chain of Thought d'abord :
 {{
-    "reasoning": "Détaille ton raisonnement point par point (RSI, MACD, News, F&G). Pourquoi acheter/vendre ?",
+    "reasoning": "Détaille ton raisonnement point par point (RSI, MACD, News, F&G, Whales). Pourquoi acheter/vendre ?",
     "signal": "ACHAT FORT" / "ACHAT" / "ATTENTE" / "VENTE" / "VENTE FORTE",
     "conviction_score": <int 0-100>,
     "allocation_pct": <int 1-100>,
@@ -254,7 +276,7 @@ def call_mistral_sync(prompt: str) -> dict:
     )
     return json.loads(resp.choices[0].message.content.strip())
 
-async def analyze_with_mistral(tech: dict, news: list[str], fng: str) -> dict:
+async def analyze_with_mistral(tech: dict, news: list[str], fng: str, whales: list[str]) -> dict:
     prompt = f"""
 Symbol: {tech['symbol']} | Prix actuel: {tech['price']}
 Fear & Greed Global: {fng}
@@ -267,6 +289,9 @@ Indicateurs 4H:
 
 News {tech['symbol']}:
 {json.dumps(news, indent=2)}
+
+Mouvements des Baleines (Whales):
+{json.dumps(whales, indent=2)}
 """
     try:
         # On utilise to_thread car le client python actuel de Mistral est synchrone
@@ -414,13 +439,14 @@ async def tech_loop():
     exchange_args = {"enableRateLimit": True, "options": {"defaultType": "spot"}}
     if not PAPER_TRADING:
         exchange_args.update({"apiKey": BINANCE_API_KEY, "secret": BINANCE_SECRET})
-    exchange = ccxt_async.binance(exchange_args)
+    exchange = ccxt_async.kraken(exchange_args)
 
     try:
         while True:
             log.info("🔄 Démarrage d'un cycle d'analyse complet...")
             fng = await get_fear_and_greed()
             log.info(f"🧠 Fear & Greed Index : {fng}")
+            whales = await get_whale_alerts()
 
             for symbol in WATCHLIST:
                 try:
@@ -429,7 +455,7 @@ async def tech_loop():
                     
                     news = await get_news(symbol)
                     
-                    analysis = await analyze_with_mistral(tech, news, fng)
+                    analysis = await analyze_with_mistral(tech, news, fng, whales)
                     if not analysis: continue
                     
                     score = analysis.get("conviction_score", 0)
@@ -511,7 +537,7 @@ async def paper_trading_loop():
     if not PAPER_TRADING:
         return
     log.info("📝 Lancement de la boucle Paper Trading (TP/SL Auto-Sell)")
-    exchange = ccxt_async.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    exchange = ccxt_async.kraken({"enableRateLimit": True, "options": {"defaultType": "spot"}})
     try:
         while True:
             portfolio = PortfolioManager()
@@ -557,7 +583,7 @@ async def telegram_polling_loop():
     offset = None
 
     # Init exchange local pour les prix
-    exchange = ccxt_async.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+    exchange = ccxt_async.kraken({"enableRateLimit": True, "options": {"defaultType": "spot"}})
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -585,7 +611,21 @@ async def telegram_polling_loop():
                                     await send_portfolio(session, chat_id, exchange)
                                 elif data_payload == "fng":
                                     fng = await get_fear_and_greed()
-                                    await send_telegram(f"🧠 <b>État du Marché</b>\n\nFear & Greed Index : {fng}")
+                                    whales = await get_whale_alerts()
+                                    whale_text = "\n".join([f"- {w}" for w in whales])
+                                    await send_telegram(f"📊 <b>Analyse Globale</b>\n\n🧠 <b>Fear & Greed Index</b> : {fng}\n\n🐋 <b>Derniers mouvements Whales</b> :\n{whale_text}")
+                                elif data_payload == "status":
+                                    uptime = int(time.time() - BOT_START_TIME)
+                                    uptime_str = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
+                                    mode = 'PAPER' if PAPER_TRADING else 'REAL'
+                                    portfolio = PortfolioManager()
+                                    open_pos = len(portfolio.state.get("positions", {}))
+                                    msg = f"🟢 <b>STATUT DU BOT</b>\n\n"
+                                    msg += f"⏱️ Uptime: {uptime_str}\n"
+                                    msg += f"⚙️ Mode: {mode}\n"
+                                    msg += f"📦 Positions ouvertes: {open_pos}\n"
+                                    msg += f"🔎 Cryptos surveillées: {len(WATCHLIST)}\n"
+                                    await send_telegram(msg)
                                 elif data_payload == "trigger":
                                     trigger_event.set()
                                     await send_telegram("🚀 <b>Analyse technique forcée !</b>\nLe bot lance le scan immédiatement.")
@@ -602,11 +642,11 @@ async def telegram_polling_loop():
                                 if str(chat_id) != str(TELEGRAM_CHAT_ID):
                                     continue
 
-                                if text.startswith("/start") or text.startswith("/menu") or text.startswith("/portfolio"):
+                                if text.startswith("/start") or text.startswith("/menu") or text.startswith("/portfolio") or text.startswith("/status"):
                                     keyboard = {
                                         "inline_keyboard": [
-                                            [{"text": "💼 Mon Portfolio", "callback_data": "portfolio"}],
-                                            [{"text": "📈 Marché & Sentiments", "callback_data": "fng"}],
+                                            [{"text": "🟢 Statut", "callback_data": "status"}, {"text": "💼 Portfolio", "callback_data": "portfolio"}],
+                                            [{"text": "📊 Marché & Whales", "callback_data": "fng"}],
                                             [{"text": "🔄 Forcer une analyse", "callback_data": "trigger"}]
                                         ]
                                     }

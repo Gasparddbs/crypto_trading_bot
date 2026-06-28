@@ -81,10 +81,10 @@ def test_imports():
 
 def test_binance_connection():
     """Teste la connexion à Binance via ccxt (API publique)."""
-    print("\n🌐 CONNEXION BINANCE :")
+    print("\n🌐 CONNEXION KRAKEN :")
     try:
         import ccxt
-        exchange = ccxt.binance({"enableRateLimit": True})
+        exchange = ccxt.kraken({"enableRateLimit": True})
 
         # Récupérer le ticker SOL/USDT
         ticker = exchange.fetch_ticker("SOL/USDT")
@@ -98,7 +98,7 @@ def test_binance_connection():
 
         return True
     except Exception as e:
-        print(f"  Connexion Binance ....... ❌ {e}")
+        print(f"  Connexion Kraken ........ ❌ {e}")
         return False
 
 
@@ -111,7 +111,7 @@ def test_technical_analysis():
         from ta.momentum import RSIIndicator
         from ta.trend import EMAIndicator
 
-        exchange = ccxt.binance({"enableRateLimit": True})
+        exchange = ccxt.kraken({"enableRateLimit": True})
         raw = exchange.fetch_ohlcv("SOL/USDT", timeframe="1h", limit=100)
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
 

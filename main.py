@@ -303,47 +303,157 @@ async def get_all_news_parallel(symbols):
         results = await asyncio.gather(*[_fetch_one(s) for s in symbols], return_exceptions=True)
         return {sym: news for sym, news in results if isinstance(sym, str)}
 
-async def get_whale_alerts():
-    alerts = []
-    if WHALE_ALERT_API_KEY:
-        try:
-            since = int(time.time()) - 3600
-            url = f"https://api.whale-alert.io/v1/transactions?api_key={WHALE_ALERT_API_KEY}&min_value=500000&start={since}"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    data = await resp.json()
-                    for tx in data.get("transactions", [])[:5]:
-                        amt = tx.get("amount_usd", 0)
-                        sym = tx.get("symbol", "?").upper()
-                        from_w = tx.get("from", {}).get("owner_type", "unknown")
-                        to_w = tx.get("to", {}).get("owner_type", "unknown")
-                        alerts.append(f"Baleine {sym}: ${amt:,.0f} | {from_w} => {to_w}")
-                    if alerts:
-                        return alerts
-        except Exception as e:
-            log.warning(f"Whale Alert API error: {e}")
+# Correspondance symbole -> ID Binance Futures (USDS-M)
+BINANCE_FUTURES_SYMBOLS = {
+    "BTC/USDT": "BTCUSDT", "ETH/USDT": "ETHUSDT", "SOL/USDT": "SOLUSDT",
+    "AVAX/USDT": "AVAXUSDT", "ADA/USDT": "ADAUSDT", "DOT/USDT": "DOTUSDT",
+    "LINK/USDT": "LINKUSDT", "DOGE/USDT": "DOGEUSDT", "XRP/USDT": "XRPUSDT",
+    "LTC/USDT": "LTCUSDT", "BCH/USDT": "BCHUSDT", "ALGO/USDT": "ALGOUSDT",
+    "ATOM/USDT": "ATOMUSDT", "UNI/USDT": "UNIUSDT", "SHIB/USDT": "SHIBUSDT"
+}
 
-    rss_sources = ["https://cointelegraph.com/rss", "https://coindesk.com/arc/outboundfeeds/rss/"]
-    whale_kws = ["whale", "transfer", "move", "accumulat", "large transaction", "billion", "million btc", "million eth"]
+# Correspondance symbole -> ID CoinGecko
+COINGECKO_IDS = {
+    "BTC/USDT": "bitcoin", "ETH/USDT": "ethereum", "SOL/USDT": "solana",
+    "AVAX/USDT": "avalanche-2", "ADA/USDT": "cardano", "DOT/USDT": "polkadot",
+    "LINK/USDT": "chainlink", "DOGE/USDT": "dogecoin", "XRP/USDT": "ripple",
+    "LTC/USDT": "litecoin", "BCH/USDT": "bitcoin-cash", "UNI/USDT": "uniswap",
+    "ALGO/USDT": "algorand", "ATOM/USDT": "cosmos", "SHIB/USDT": "shiba-inu"
+}
+
+
+async def get_futures_data(symbol: str, session: aiohttp.ClientSession) -> dict:
+    """Recupere funding rate, open interest et long/short ratio depuis Binance Futures (gratuit, sans cle API)."""
+    fsym = BINANCE_FUTURES_SYMBOLS.get(symbol)
+    if not fsym:
+        return {}
+    base = "https://fapi.binance.com"
+    result = {}
+    try:
+        # Funding Rate
+        async with session.get(f"{base}/fapi/v1/fundingRate", params={"symbol": fsym, "limit": 1},
+                               timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data:
+                    result["funding_rate_pct"] = round(float(data[0]["fundingRate"]) * 100, 4)
+    except Exception:
+        pass
+    try:
+        # Open Interest
+        async with session.get(f"{base}/fapi/v1/openInterest", params={"symbol": fsym},
+                               timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                result["open_interest"] = round(float(data.get("openInterest", 0)), 2)
+    except Exception:
+        pass
+    try:
+        # Long/Short Ratio (comptes globaux)
+        async with session.get(f"{base}/futures/data/globalLongShortAccountRatio",
+                               params={"symbol": fsym, "period": "4h", "limit": 1},
+                               timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                if data:
+                    result["long_pct"] = round(float(data[0]["longAccount"]) * 100, 1)
+                    result["short_pct"] = round(float(data[0]["shortAccount"]) * 100, 1)
+    except Exception:
+        pass
+    return result
+
+
+async def get_volume_anomalies(symbols: list, session: aiohttp.ClientSession) -> dict:
+    """Detecte les spikes de volume via CoinGecko (gratuit)."""
+    cg_ids = [COINGECKO_IDS[s] for s in symbols if s in COINGECKO_IDS]
+    if not cg_ids:
+        return {}
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "ids": ",".join(cg_ids[:15]),
+        "order": "market_cap_desc",
+        "per_page": 15,
+        "page": 1,
+        "price_change_percentage": "24h"
+    }
+    anomalies = {}
+    try:
+        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                for coin in data:
+                    cg_id = coin["id"]
+                    # Retrouver le symbole
+                    sym = next((k for k, v in COINGECKO_IDS.items() if v == cg_id), None)
+                    if not sym:
+                        continue
+                    vol_24h = coin.get("total_volume", 0)
+                    price_change = coin.get("price_change_percentage_24h", 0) or 0
+                    market_cap = coin.get("market_cap", 1) or 1
+                    # Volume/MarketCap ratio: > 0.15 = activite inhabituelle (baleines)
+                    vol_to_cap = (vol_24h / market_cap) if market_cap > 0 else 0
+                    anomalies[sym] = {
+                        "vol_24h_usd": int(vol_24h),
+                        "price_change_24h": round(price_change, 2),
+                        "vol_to_cap_ratio": round(vol_to_cap, 3)
+                    }
+    except Exception as e:
+        log.warning(f"CoinGecko error: {e}")
+    return anomalies
+
+
+async def get_market_intelligence() -> dict:
+    """Agregation d'intelligence de marche : Binance Futures + CoinGecko + RSS.
+    Remplace Whale Alert avec des donnees institutionnelles gratuites."""
+    intelligence = {
+        "futures": {},       # funding rate, open interest, long/short
+        "volume_anomalies": {},  # spikes CoinGecko
+        "headlines": []      # RSS filtrees
+    }
+
     async with aiohttp.ClientSession() as session:
-        for rss_url in rss_sources:
+        # 1. Donnees Futures Binance pour BTC + ETH + les plus liquides
+        priority_symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT"]
+        futures_tasks = [get_futures_data(sym, session) for sym in priority_symbols]
+        futures_results = await asyncio.gather(*futures_tasks, return_exceptions=True)
+        for sym, res in zip(priority_symbols, futures_results):
+            if isinstance(res, dict) and res:
+                intelligence["futures"][sym] = res
+                # Log les signaux forts
+                fr = res.get("funding_rate_pct", 0)
+                lp = res.get("long_pct", 50)
+                if fr and abs(fr) > 0.05:
+                    sign = "negatif (shorts dominants->squeeze possible)" if fr < 0 else "positif (longs surpayes)"
+                    log.info(f"Futures {sym}: Funding rate {fr:+.4f}% ({sign})")
+                if lp and lp < 35:
+                    log.info(f"Futures {sym}: Long/Short = {lp}%/{100-lp:.0f}% -> squeeze haussier possible")
+
+        # 2. Volume anomalies CoinGecko
+        intelligence["volume_anomalies"] = await get_volume_anomalies(WATCHLIST, session)
+
+        # 3. Headlines RSS filtrees (mouvements significatifs)
+        rss_kws = ["whale", "billion", "million btc", "million eth", "large transfer",
+                   "accumulate", "dump", "sell-off", "surge", "crash", "rally", "liquidation"]
+        for rss_url in ["https://cointelegraph.com/rss", "https://coindesk.com/arc/outboundfeeds/rss/"]:
             try:
                 async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     xml = await resp.text()
                     soup = BeautifulSoup(xml, "xml")
-                    for item in soup.find_all("item")[:20]:
+                    for item in soup.find_all("item")[:15]:
                         title = item.find("title")
                         if title:
                             t = title.get_text(strip=True)
-                            if any(kw in t.lower() for kw in whale_kws):
-                                alerts.append(t)
-                                if len(alerts) >= 4:
+                            if any(kw in t.lower() for kw in rss_kws):
+                                intelligence["headlines"].append(t)
+                                if len(intelligence["headlines"]) >= 4:
                                     break
             except Exception:
                 continue
-            if len(alerts) >= 4:
+            if len(intelligence["headlines"]) >= 4:
                 break
-    return alerts[:4] if alerts else ["Aucun mouvement majeur de baleine detecte."]
+
+    return intelligence
 
 
 async def fetch_ohlcv_async(exchange, symbol, tf):
@@ -503,16 +613,50 @@ def call_mistral_sync(prompt):
     return json.loads(resp.choices[0].message.content.strip())
 
 
-async def analyze_with_mistral(tech, news, fng, whales, btc_context):
+async def analyze_with_mistral(tech, news, fng, market_intel, btc_context):
     d1 = tech.get("1d", {})
+    sym = tech["symbol"]
+
+    # Extraire les donnees specifiques a ce symbole depuis l'intelligence de marche
+    futures_sym = market_intel.get("futures", {}).get(sym, {})
+    vol_anom = market_intel.get("volume_anomalies", {}).get(sym, {})
+    headlines = market_intel.get("headlines", [])
+
+    # Construire un resume textuel de l'intelligence de marche
+    intel_summary = []
+    if futures_sym:
+        fr = futures_sym.get("funding_rate_pct")
+        lp = futures_sym.get("long_pct")
+        oi = futures_sym.get("open_interest")
+        if fr is not None:
+            fr_signal = "SHORTS DOMINANTS -> squeeze haussier possible" if fr < -0.02 else ("LONGS SURPAYES -> attention retournement" if fr > 0.05 else "neutre")
+            intel_summary.append(f"Funding Rate: {fr:+.4f}% ({fr_signal})")
+        if lp is not None:
+            ls_signal = "MAJORITE SHORT -> squeeze possible" if lp < 38 else ("MAJORITE LONG -> risque retournement" if lp > 65 else "equilibre")
+            intel_summary.append(f"Long/Short: {lp:.0f}%/{100-lp:.0f}% ({ls_signal})")
+        if oi is not None:
+            intel_summary.append(f"Open Interest: {oi:,.0f} contrats")
+    if vol_anom:
+        vc = vol_anom.get("vol_to_cap_ratio", 0)
+        pc = vol_anom.get("price_change_24h", 0)
+        vol_signal = "ACTIVITE BALEINE DETECTEE" if vc > 0.2 else ("volume eleve" if vc > 0.1 else "volume normal")
+        intel_summary.append(f"Volume/MarketCap ratio: {vc:.3f} ({vol_signal}) | Prix 24H: {pc:+.2f}%")
+
+    intel_text = "\n".join(intel_summary) if intel_summary else "Donnees futures non disponibles pour cet actif."
+
     prompt = f"""
 === CONTEXTE MARCHE GLOBAL ===
 Bitcoin: Prix={btc_context.get('price', 'N/A')} | Tendance 4H: {btc_context.get('trend', 'N/A')} ({btc_context.get('change_pct', 0):+.2f}%)
 Fear & Greed Index: {fng}
-Baleines: {json.dumps(whales, ensure_ascii=False)}
+
+=== DONNEES INSTITUTIONNELLES (Binance Futures + CoinGecko) ===
+{intel_text}
+
+Titres de marche recents:
+{json.dumps(headlines[:3], ensure_ascii=False)}
 
 === ACTIF ANALYSE ===
-Symbole: {tech['symbol']} | Prix actuel: {tech['price']}
+Symbole: {sym} | Prix actuel: {tech['price']}
 
 --- Indicateurs 1H ---
 {json.dumps(tech.get('1h', {}), indent=2)}
@@ -523,19 +667,20 @@ Symbole: {tech['symbol']} | Prix actuel: {tech['price']}
 --- Tendance Journaliere (1D) ---
 Trend fond: {d1.get('trend', 'N/A')} | RSI 1D: {d1.get('rsi', 'N/A')} | MACD 1D: {d1.get('macd_cross', 'N/A')}
 
---- Actualites recentes ---
+--- Actualites {sym} ---
 {json.dumps(news, ensure_ascii=False, indent=2)}
 
 === QUESTION ===
-Ce moment est-il une opportunite d'achat avec un bon ratio risque/rendement (min 2:1) ?
-Prix actuel = {tech['price']}. Si achat: SL doit etre < {tech['price']} et TP > {tech['price']}.
+Ce moment est-il une opportunite d'achat avec ratio R/R >= 2:1 ?
+Considere notamment le funding rate et le long/short ratio comme signaux de positionnement institutionnel.
+Prix actuel = {tech['price']}. Si achat: SL < {tech['price']}, TP > {tech['price']}.
 """
     try:
         res = await asyncio.to_thread(call_mistral_sync, prompt)
         res["conviction_score"] = int(res.get("conviction_score", 0))
         return res
     except Exception as e:
-        log.error(f"Mistral Error pour {tech['symbol']}: {e}")
+        log.error(f"Mistral Error pour {sym}: {e}")
         return None
 
 
@@ -596,7 +741,8 @@ async def tech_loop():
                     await send_telegram("Mode defensif desactive -- BTC se stabilise.")
                     log.info("Mode defensif desactive")
 
-            whales = await get_whale_alerts()
+            market_intel = await get_market_intelligence()
+            log.info(f"Intelligence de marche: {len(market_intel.get('futures', {}))} actifs futures, {len(market_intel.get('volume_anomalies', {}))} volumes CoinGecko")
 
             log.info(f"Scan parallele de {len(WATCHLIST)} cryptos...")
             tasks = [get_technical_data_for_symbol(exchange, sym) for sym in WATCHLIST]
@@ -620,7 +766,7 @@ async def tech_loop():
                 sym = tech["symbol"]
                 try:
                     news = all_news.get(sym, [])
-                    analysis = await analyze_with_mistral(tech, news, fng, whales, btc_ctx)
+                    analysis = await analyze_with_mistral(tech, news, fng, market_intel, btc_ctx)
                     if not analysis:
                         continue
 
@@ -812,15 +958,42 @@ async def telegram_polling_loop():
 
                                 elif payload == "fng":
                                     fng = await get_fear_and_greed()
-                                    whales = await get_whale_alerts()
-                                    whale_text = "\n".join([f"- {w}" for w in whales])
-                                    def_txt = "MODE DEFENSIF ACTIF\n" if defensive_mode else ""
-                                    await send_telegram(
-                                        f"<b>Analyse Globale</b>\n\n"
+                                    intel = await get_market_intelligence()
+                                    def_txt = "MODE DEFENSIF ACTIF\n\n" if defensive_mode else ""
+
+                                    # Résumé Futures Binance
+                                    futures_txt = ""
+                                    for fsym, fd in intel.get("futures", {}).items():
+                                        token = fsym.replace("/USDT", "")
+                                        fr = fd.get("funding_rate_pct")
+                                        lp = fd.get("long_pct")
+                                        fr_str = f"FR:{fr:+.4f}%" if fr is not None else ""
+                                        ls_str = f" | L/S:{lp:.0f}%/{100-lp:.0f}%" if lp is not None else ""
+                                        futures_txt += f"  {token}: {fr_str}{ls_str}\n"
+
+                                    # Résumé Volume Anomalies CoinGecko
+                                    vol_txt = ""
+                                    anomalies = [(s, d) for s, d in intel.get("volume_anomalies", {}).items()
+                                                 if d.get("vol_to_cap_ratio", 0) > 0.1]
+                                    anomalies.sort(key=lambda x: x[1].get("vol_to_cap_ratio", 0), reverse=True)
+                                    for sym_a, da in anomalies[:5]:
+                                        token = sym_a.replace("/USDT", "")
+                                        vc = da["vol_to_cap_ratio"]
+                                        pc = da["price_change_24h"]
+                                        flag = " BALEINE?" if vc > 0.2 else ""
+                                        vol_txt += f"  {token}: Vol/Cap={vc:.3f}{flag} | 24H:{pc:+.1f}%\n"
+
+                                    headlines_txt = "\n".join([f"- {h}" for h in intel.get("headlines", [])[:3]])
+
+                                    msg = (
+                                        f"<b>Intelligence de Marche</b>\n\n"
                                         f"{def_txt}"
                                         f"<b>Fear & Greed</b>: {fng}\n\n"
-                                        f"<b>Mouvements Whales</b>:\n{whale_text}"
+                                        f"<b>Binance Futures (FR / Long-Short)</b>:\n{futures_txt or '  N/A'}\n"
+                                        f"<b>Volumes inhabituels (CoinGecko)</b>:\n{vol_txt or '  Aucun signal volume'}\n"
+                                        f"<b>Titres marche</b>:\n{headlines_txt or '  Aucun'}"
                                     )
+                                    await send_telegram(msg)
 
                                 elif payload == "status":
                                     uptime = int(time.time() - BOT_START_TIME)

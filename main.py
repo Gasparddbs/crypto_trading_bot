@@ -70,7 +70,12 @@ MIN_VOLUME_USD_24H = 5_000_000
 WATCHLIST = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "AVAX/USDT", "ADA/USDT",
     "DOT/USDT", "LINK/USDT", "DOGE/USDT", "XRP/USDT", "LTC/USDT",
-    "BCH/USDT", "UNI/USDT", "ALGO/USDT", "ATOM/USDT", "SHIB/USDT"
+    "BCH/USDT", "UNI/USDT", "ALGO/USDT", "ATOM/USDT", "SHIB/USDT",
+    "MATIC/USDT", "NEAR/USDT", "APT/USDT", "ARB/USDT", "OP/USDT",
+    "INJ/USDT", "TIA/USDT", "SEI/USDT", "SUI/USDT", "FET/USDT",
+    "RNDR/USDT", "LDO/USDT", "AAVE/USDT", "MKR/USDT", "SNX/USDT",
+    "GRT/USDT", "FIL/USDT", "ETC/USDT", "XLM/USDT", "FTM/USDT",
+    "SAND/USDT", "MANA/USDT", "GALA/USDT", "CHZ/USDT", "APE/USDT"
 ]
 TIMEFRAMES = ["1h", "4h", "1d"]
 
@@ -513,7 +518,7 @@ async def fetch_ohlcv_async(exchange, symbol, tf):
             df[c] = pd.to_numeric(df[c], errors="coerce")
         return df
     except Exception as e:
-        log.warning(f"Erreur OHLCV {symbol} {tf}: {e}")
+        log.debug(f"Erreur OHLCV ignoree {symbol} {tf}: {e}")
         return pd.DataFrame()
 
 
@@ -815,9 +820,14 @@ async def tech_loop():
             market_intel = await get_market_intelligence()
             log.info(f"Intelligence de marche: {len(market_intel.get('futures', {}))} actifs futures, {len(market_intel.get('volume_anomalies', {}))} volumes CoinGecko")
 
-            log.info(f"Scan parallele de {len(WATCHLIST)} cryptos...")
-            tasks = [get_technical_data_for_symbol(exchange, sym) for sym in WATCHLIST]
-            all_tech = await asyncio.gather(*tasks, return_exceptions=True)
+            log.info(f"Scan de {len(WATCHLIST)} cryptos par lots (eviter le ban Kraken)...")
+            all_tech = []
+            for i in range(0, len(WATCHLIST), 10):
+                chunk = WATCHLIST[i:i+10]
+                tasks = [get_technical_data_for_symbol(exchange, sym) for sym in chunk]
+                res = await asyncio.gather(*tasks, return_exceptions=True)
+                all_tech.extend(res)
+                await asyncio.sleep(1.5)
 
             candidates = []
             for tech in all_tech:

@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 import aiohttp
+import aiofiles
 from aiohttp import web
 import ccxt.async_support as ccxt_async
 import pandas as pd
@@ -52,7 +53,6 @@ MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
-WHALE_ALERT_API_KEY = os.getenv("WHALE_ALERT_API_KEY", "")
 
 BOT_START_TIME = time.time()
 
@@ -103,6 +103,48 @@ log = setup_logging()
 
 
 # ============================================================
+# CACHE & RETRY UTILITIES
+# ============================================================
+_cache = {}
+
+
+def cached(key, ttl_seconds=300):
+    """Verifie le cache. Retourne (is_valid, cached_value)."""
+    entry = _cache.get(key)
+    if entry and (time.time() - entry["ts"]) < ttl_seconds:
+        return True, entry["val"]
+    return False, None
+
+
+def cache_set(key, value):
+    """Stocke une valeur dans le cache avec le timestamp courant."""
+    _cache[key] = {"val": value, "ts": time.time()}
+
+
+async def fetch_json_retry(session, url, params=None, retries=3, delay=1.5):
+    """Requete HTTP GET JSON avec retry et backoff exponentiel."""
+    for attempt in range(retries):
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 429:
+                    wait = delay * (2 ** attempt)
+                    log.warning(f"Rate limited (429) sur {url}, retry dans {wait:.1f}s")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status == 200:
+                    return await resp.json()
+                return None
+        except Exception as e:
+            if attempt < retries - 1:
+                wait = delay * (2 ** attempt)
+                log.warning(f"Erreur fetch: {e}, retry {attempt+1}/{retries} dans {wait:.1f}s")
+                await asyncio.sleep(wait)
+            else:
+                log.error(f"Les {retries} tentatives ont echoue pour {url}: {e}")
+    return None
+
+
+# ============================================================
 # PORTFOLIO MANAGER (Singleton)
 # ============================================================
 class PortfolioManager:
@@ -127,9 +169,11 @@ class PortfolioManager:
             with open(self.file, "r") as f:
                 self.state = json.load(f)
 
-    def _save(self):
-        with open(self.file, "w") as f:
-            json.dump(self.state, f, indent=4)
+    async def _save(self):
+        tmp_file = self.file + ".tmp"
+        async with aiofiles.open(tmp_file, "w") as f:
+            await f.write(json.dumps(self.state, indent=4))
+        os.replace(tmp_file, self.file)
 
     def get_total_value(self, current_prices=None):
         total = self.state["balance"]
@@ -138,12 +182,12 @@ class PortfolioManager:
             total += price * pos["qty"]
         return total
 
-    def check_daily_drawdown(self, current_total):
+    async def check_daily_drawdown(self, current_total):
         today = datetime.now().strftime("%Y-%m-%d")
         if self.state.get("daily_start") != today:
             self.state["daily_start"] = today
             self.state["daily_start_value"] = current_total
-            self._save()
+            await self._save()
             return False
         start_val = self.state.get("daily_start_value", current_total)
         if start_val <= 0:
@@ -207,7 +251,7 @@ class PortfolioManager:
             "date": datetime.now().isoformat(),
             "trailing_active": False
         }
-        self._save()
+        await self._save()
 
         await send_telegram(
             f"PAPER TRADE V4\n"
@@ -248,12 +292,17 @@ async def send_telegram(text, parse_mode="HTML", reply_markup=None):
 # DATA FETCHING
 # ============================================================
 async def get_fear_and_greed():
+    hit, val = cached("fng", ttl_seconds=600)
+    if hit:
+        return val
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get("https://api.alternative.me/fng/", timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 data = await resp.json()
                 fng = data["data"][0]
-                return f"{fng['value']} ({fng['value_classification']})"
+                result = f"{fng['value']} ({fng['value_classification']})"
+                cache_set("fng", result)
+                return result
     except Exception as e:
         log.warning(f"Erreur Fear & Greed: {e}")
         return "N/A"
@@ -294,12 +343,23 @@ async def get_all_news_parallel(symbols):
     async with aiohttp.ClientSession() as session:
         async def _fetch_one(symbol):
             token = extract_token_name(symbol)
+            combined = []
             if CRYPTOPANIC_API_KEY:
-                news = await get_news_cryptopanic(token, session)
-                if news:
-                    return symbol, news
-            news = await get_news_google(token, session)
-            return symbol, news if news else [f"Pas d'actualite pour {token}"]
+                cp_news = await get_news_cryptopanic(token, session)
+                if cp_news:
+                    combined.extend(cp_news)
+            google_news = await get_news_google(token, session)
+            if google_news:
+                combined.extend(google_news)
+            # Deduplique par titre
+            seen = set()
+            unique = []
+            for title in combined:
+                key = title.lower().strip()
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(title)
+            return symbol, unique if unique else [f"Pas d'actualite pour {token}"]
         results = await asyncio.gather(*[_fetch_one(s) for s in symbols], return_exceptions=True)
         return {sym: news for sym, news in results if isinstance(sym, str)}
 
@@ -323,48 +383,43 @@ COINGECKO_IDS = {
 
 
 async def get_futures_data(symbol: str, session: aiohttp.ClientSession) -> dict:
-    """Recupere funding rate, open interest et long/short ratio depuis Binance Futures (gratuit, sans cle API)."""
+    """Recupere funding rate, open interest et long/short ratio depuis Binance Futures (avec retry)."""
     fsym = BINANCE_FUTURES_SYMBOLS.get(symbol)
     if not fsym:
         return {}
     base = "https://fapi.binance.com"
     result = {}
-    try:
-        # Funding Rate
-        async with session.get(f"{base}/fapi/v1/fundingRate", params={"symbol": fsym, "limit": 1},
-                               timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data:
-                    result["funding_rate_pct"] = round(float(data[0]["fundingRate"]) * 100, 4)
-    except Exception:
-        pass
-    try:
-        # Open Interest
-        async with session.get(f"{base}/fapi/v1/openInterest", params={"symbol": fsym},
-                               timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                result["open_interest"] = round(float(data.get("openInterest", 0)), 2)
-    except Exception:
-        pass
-    try:
-        # Long/Short Ratio (comptes globaux)
-        async with session.get(f"{base}/futures/data/globalLongShortAccountRatio",
-                               params={"symbol": fsym, "period": "4h", "limit": 1},
-                               timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data:
-                    result["long_pct"] = round(float(data[0]["longAccount"]) * 100, 1)
-                    result["short_pct"] = round(float(data[0]["shortAccount"]) * 100, 1)
-    except Exception:
-        pass
+    # Funding Rate
+    data = await fetch_json_retry(session, f"{base}/fapi/v1/fundingRate", params={"symbol": fsym, "limit": 1})
+    if data and isinstance(data, list) and data:
+        try:
+            result["funding_rate_pct"] = round(float(data[0]["fundingRate"]) * 100, 4)
+        except (KeyError, ValueError, IndexError):
+            pass
+    # Open Interest
+    data = await fetch_json_retry(session, f"{base}/fapi/v1/openInterest", params={"symbol": fsym})
+    if data and isinstance(data, dict):
+        try:
+            result["open_interest"] = round(float(data.get("openInterest", 0)), 2)
+        except (ValueError, TypeError):
+            pass
+    # Long/Short Ratio (comptes globaux)
+    data = await fetch_json_retry(session, f"{base}/futures/data/globalLongShortAccountRatio",
+                                  params={"symbol": fsym, "period": "4h", "limit": 1})
+    if data and isinstance(data, list) and data:
+        try:
+            result["long_pct"] = round(float(data[0]["longAccount"]) * 100, 1)
+            result["short_pct"] = round(float(data[0]["shortAccount"]) * 100, 1)
+        except (KeyError, ValueError, IndexError):
+            pass
     return result
 
 
 async def get_volume_anomalies(symbols: list, session: aiohttp.ClientSession) -> dict:
-    """Detecte les spikes de volume via CoinGecko (gratuit)."""
+    """Detecte les spikes de volume via CoinGecko (avec cache et retry)."""
+    hit, val = cached("vol_anomalies", ttl_seconds=300)
+    if hit:
+        return val
     cg_ids = [COINGECKO_IDS[s] for s in symbols if s in COINGECKO_IDS]
     if not cg_ids:
         return {}
@@ -378,28 +433,23 @@ async def get_volume_anomalies(symbols: list, session: aiohttp.ClientSession) ->
         "price_change_percentage": "24h"
     }
     anomalies = {}
-    try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                for coin in data:
-                    cg_id = coin["id"]
-                    # Retrouver le symbole
-                    sym = next((k for k, v in COINGECKO_IDS.items() if v == cg_id), None)
-                    if not sym:
-                        continue
-                    vol_24h = coin.get("total_volume", 0)
-                    price_change = coin.get("price_change_percentage_24h", 0) or 0
-                    market_cap = coin.get("market_cap", 1) or 1
-                    # Volume/MarketCap ratio: > 0.15 = activite inhabituelle (baleines)
-                    vol_to_cap = (vol_24h / market_cap) if market_cap > 0 else 0
-                    anomalies[sym] = {
-                        "vol_24h_usd": int(vol_24h),
-                        "price_change_24h": round(price_change, 2),
-                        "vol_to_cap_ratio": round(vol_to_cap, 3)
-                    }
-    except Exception as e:
-        log.warning(f"CoinGecko error: {e}")
+    data = await fetch_json_retry(session, url, params=params)
+    if data and isinstance(data, list):
+        for coin in data:
+            cg_id = coin["id"]
+            sym = next((k for k, v in COINGECKO_IDS.items() if v == cg_id), None)
+            if not sym:
+                continue
+            vol_24h = coin.get("total_volume", 0)
+            price_change = coin.get("price_change_percentage_24h", 0) or 0
+            market_cap = coin.get("market_cap", 1) or 1
+            vol_to_cap = (vol_24h / market_cap) if market_cap > 0 else 0
+            anomalies[sym] = {
+                "vol_24h_usd": int(vol_24h),
+                "price_change_24h": round(price_change, 2),
+                "vol_to_cap_ratio": round(vol_to_cap, 3)
+            }
+    cache_set("vol_anomalies", anomalies)
     return anomalies
 
 
@@ -584,6 +634,7 @@ REGLES ABSOLUES :
 3. Le RSI seul n'est PAS suffisant : exige une confirmation (MACD + Volume ou Stoch RSI)
 4. Un volume relatif < 0.8 signifie absence de conviction -> ATTENTE
 5. Justifie toujours pourquoi ce n'est PAS un piege avant de recommander un ACHAT
+6. Pour le SL/TP, tu DOIS choisir l'une des options pre-calculees fournies (A ou B). Ne genere PAS tes propres niveaux.
 
 Retourne EXACTEMENT ce JSON (rien avant ni apres) :
 {
@@ -591,17 +642,19 @@ Retourne EXACTEMENT ce JSON (rien avant ni apres) :
     "signal": "ACHAT FORT",
     "conviction_score": 75,
     "allocation_pct": 30,
+    "selected_option": "A",
     "take_profit_price": "0.0",
     "stop_loss_price": "0.0",
     "risk_reward_ratio": "2.5:1"
 }
 Les valeurs de signal possibles sont exactement : "ACHAT FORT" | "ACHAT" | "ATTENTE" | "VENTE" | "VENTE FORTE"
+"selected_option" doit etre "A" (conservateur) ou "B" (agressif), correspondant aux niveaux pre-calcules fournis.
 """
 
 
-def call_mistral_sync(prompt):
+async def call_mistral_async(prompt):
     client = Mistral(api_key=MISTRAL_API_KEY)
-    resp = client.chat.complete(
+    resp = await client.chat.complete_async(
         model=MISTRAL_MODEL,
         messages=[
             {"role": "system", "content": MISTRAL_SYSTEM_V2},
@@ -644,6 +697,24 @@ async def analyze_with_mistral(tech, news, fng, market_intel, btc_context):
 
     intel_text = "\n".join(intel_summary) if intel_summary else "Donnees futures non disponibles pour cet actif."
 
+    # Pre-calcul des niveaux SL/TP bases sur l'ATR 4H
+    price = tech["price"]
+    atr = tech.get("atr_4h")
+    atr_levels_text = ""
+    if atr and atr > 0 and price:
+        sl_a = round(price - 1.0 * atr, 6)
+        tp_a = round(price + 2.0 * atr, 6)
+        sl_b = round(price - 1.5 * atr, 6)
+        tp_b = round(price + 3.0 * atr, 6)
+        rr_a = round((tp_a - price) / (price - sl_a), 1) if price > sl_a else 0
+        rr_b = round((tp_b - price) / (price - sl_b), 1) if price > sl_b else 0
+        atr_levels_text = f"""
+=== NIVEAUX PRE-CALCULES (ATR 4H = {atr:.6f}) ===
+Option A (Conservateur) : SL = {sl_a} (-1 ATR) | TP = {tp_a} (+2 ATR) | R/R = {rr_a}:1
+Option B (Agressif)     : SL = {sl_b} (-1.5 ATR) | TP = {tp_b} (+3 ATR) | R/R = {rr_b}:1
+IMPORTANT: Tu DOIS choisir Option A ou Option B. Ne genere PAS tes propres niveaux.
+"""
+
     prompt = f"""
 === CONTEXTE MARCHE GLOBAL ===
 Bitcoin: Prix={btc_context.get('price', 'N/A')} | Tendance 4H: {btc_context.get('trend', 'N/A')} ({btc_context.get('change_pct', 0):+.2f}%)
@@ -670,13 +741,14 @@ Trend fond: {d1.get('trend', 'N/A')} | RSI 1D: {d1.get('rsi', 'N/A')} | MACD 1D:
 --- Actualites {sym} ---
 {json.dumps(news, ensure_ascii=False, indent=2)}
 
+{atr_levels_text}
 === QUESTION ===
 Ce moment est-il une opportunite d'achat avec ratio R/R >= 2:1 ?
 Considere notamment le funding rate et le long/short ratio comme signaux de positionnement institutionnel.
-Prix actuel = {tech['price']}. Si achat: SL < {tech['price']}, TP > {tech['price']}.
+Prix actuel = {tech['price']}. Si achat, selectionne l'Option A ou B ci-dessus pour tes niveaux SL/TP.
 """
     try:
-        res = await asyncio.to_thread(call_mistral_sync, prompt)
+        res = await call_mistral_async(prompt)
         res["conviction_score"] = int(res.get("conviction_score", 0))
         return res
     except Exception as e:
@@ -719,6 +791,7 @@ async def tech_loop():
 
     try:
         while True:
+            trigger_event.clear()
             log.info("Demarrage cycle V4 (scan parallele)...")
             fng = await get_fear_and_greed()
             log.info(f"Fear & Greed: {fng}")
@@ -794,7 +867,7 @@ async def tech_loop():
                 await asyncio.sleep(2)
 
             total_val = portfolio.get_total_value()
-            if portfolio.check_daily_drawdown(total_val):
+            if await portfolio.check_daily_drawdown(total_val):
                 await send_telegram(
                     f"ALERTE DRAWDOWN\n"
                     f"Portfolio perd plus de {DAILY_DRAWDOWN_LIMIT}% aujourd'hui.\n"
@@ -803,11 +876,10 @@ async def tech_loop():
                 log.warning(f"Drawdown journalier atteint (valeur: {total_val:.2f} USDT)")
                 defensive_mode = True
 
-            next_scan_time = time.time() + 4 * 3600
-            log.info("Fin du scan V4. Attente 4h ou Trigger News...")
-            trigger_event.clear()
+            next_scan_time = time.time() + 3600
+            log.info("Fin du scan V4. Attente 1h ou Trigger News...")
             try:
-                await asyncio.wait_for(trigger_event.wait(), timeout=4 * 3600)
+                await asyncio.wait_for(trigger_event.wait(), timeout=3600)
                 log.info("Scan reveille par Trigger News!")
                 next_scan_time = 0
             except asyncio.TimeoutError:
@@ -842,7 +914,7 @@ async def paper_trading_loop():
                             if new_sl > sl:
                                 pos["sl"] = new_sl
                                 pos["trailing_active"] = True
-                                portfolio._save()
+                                await portfolio._save()
                                 log.info(f"Trailing SL {sym}: {sl:.4f} -> {new_sl:.4f}")
 
                         if current_price >= tp or current_price <= pos["sl"]:
@@ -853,7 +925,7 @@ async def paper_trading_loop():
                             net = gross * 0.999
                             state["balance"] += net
                             del state["positions"][sym]
-                            portfolio._save()
+                            await portfolio._save()
                             pnl_pct = ((current_price - entry) / entry) * 100
                             pnl_usdt = net - (entry * qty)
                             log.info(f"{reason} sur {sym}: PNL {pnl_pct:+.2f}%")

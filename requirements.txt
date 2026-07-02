@@ -19,5 +19,8 @@ mistralai<2.0.0             # Client officiel Mistral AI (qui supporte l'async)
 beautifulsoup4>=4.12.0       # Parsing HTML
 lxml>=5.0.0                  # Parser XML pour Google News RSS
 
+# --- Asynchrone (fichiers) ---
+aiofiles>=24.0.0              # I/O fichiers asynchrones
+
 # --- Configuration ---
 python-dotenv>=1.1.0         # Chargement des variables d'environnement (.env)

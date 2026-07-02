@@ -1169,7 +1169,7 @@ async def main():
     log.info("=" * 60)
     log.info("CRYPTO TRADING BOT V4")
     log.info(f"Mode      : {'PAPER TRADING' if PAPER_TRADING else 'REAL TRADING'}")
-    log.info(f"Modele    : {MISTRAL_MODEL}")
+    log.info(f"Modele    : {GROQ_MODEL}")
     log.info(f"Watchlist : {len(WATCHLIST)} cryptos")
     log.info(f"Max Pos   : {MAX_POSITIONS} x {MAX_USDT_PER_POSITION} USDT")
     log.info(f"Conviction: >= {CONVICTION_THRESHOLD}/100")

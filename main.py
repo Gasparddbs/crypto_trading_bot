@@ -36,8 +36,9 @@ from ta.momentum import RSIIndicator, StochRSIIndicator
 from ta.trend import EMAIndicator, MACD
 from ta.volatility import BollingerBands, AverageTrueRange
 from bs4 import BeautifulSoup
+import feedparser
 from dotenv import load_dotenv
-from mistralai import Mistral
+from groq import AsyncGroq
 
 # ============================================================
 # CONFIGURATION
@@ -48,8 +49,8 @@ PAPER_TRADING = os.getenv("PAPER_TRADING", "True").lower() == "true"
 
 KRAKEN_API_KEY = os.getenv("KRAKEN_API_KEY", "")
 KRAKEN_SECRET = os.getenv("KRAKEN_SECRET", "")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
-MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-70b-8192")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CRYPTOPANIC_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "")
@@ -322,21 +323,19 @@ async def get_news_cryptopanic(token, session):
 async def get_news_google(token, session):
     query = quote(f"{token} crypto")
     url = f"https://news.google.com/rss/search?q={query}+when:2d&hl=en-US&gl=US&ceid=US:en"
-    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             xml = await resp.text()
-            soup = BeautifulSoup(xml, "xml")
+            feed = feedparser.parse(xml)
             headlines = []
-            for item in soup.find_all("item")[:5]:
-                title = item.find("title")
-                if title:
-                    t = title.get_text(strip=True)
-                    if " - " in t:
-                        t = t.rsplit(" - ", 1)[0]
-                    headlines.append(t)
+            for entry in feed.entries[:5]:
+                t = entry.title
+                if " - " in t:
+                    t = t.rsplit(" - ", 1)[0]
+                headlines.append(t)
             return headlines
-    except Exception:
+    except Exception as e:
+        log.warning(f"Erreur RSS Google News pour {token}: {e}")
         return []
 
 async def get_all_news_parallel(symbols):
@@ -489,15 +488,13 @@ async def get_market_intelligence() -> dict:
             try:
                 async with session.get(rss_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     xml = await resp.text()
-                    soup = BeautifulSoup(xml, "xml")
-                    for item in soup.find_all("item")[:15]:
-                        title = item.find("title")
-                        if title:
-                            t = title.get_text(strip=True)
-                            if any(kw in t.lower() for kw in rss_kws):
-                                intelligence["headlines"].append(t)
-                                if len(intelligence["headlines"]) >= 4:
-                                    break
+                    feed = feedparser.parse(xml)
+                    for entry in feed.entries[:15]:
+                        t = entry.title
+                        if any(kw in t.lower() for kw in rss_kws):
+                            intelligence["headlines"].append(t)
+                            if len(intelligence["headlines"]) >= 4:
+                                break
             except Exception:
                 continue
             if len(intelligence["headlines"]) >= 4:
@@ -623,24 +620,25 @@ async def get_btc_context(exchange):
 
 
 # ============================================================
-# MISTRAL AI V2
+# GROQ AI (ULTRA-RAPIDE)
 # ============================================================
-MISTRAL_SYSTEM_V2 = """Tu es un algorithme de trading institutionnel avec 20 ans d'experience.
-Ta mission : analyser les donnees techniques et macro pour identifier des opportunites a fort rapport risque/rendement.
+AI_SYSTEM_PROMPT = """Tu es un algorithme de trading institutionnel ultra-rationnel avec 20 ans d'experience.
+Ta mission : analyser les donnees pour identifier UNIQUEMENT des opportunites certaines a fort rapport risque/rendement.
 
-REGLES ABSOLUES :
-1. Le ratio Risk/Reward doit etre MINIMUM 2:1
-2. Si le contexte BTC est BAISSIER, sois 2x plus prudent et prefere l'ATTENTE
-3. Le RSI seul n'est PAS suffisant : exige une confirmation (MACD + Volume ou Stoch RSI)
-4. Un volume relatif < 0.8 signifie absence de conviction -> ATTENTE
-5. Justifie toujours pourquoi ce n'est PAS un piege avant de recommander un ACHAT
-6. Pour le SL/TP, tu DOIS choisir l'une des options pre-calculees fournies (A ou B). Ne genere PAS tes propres niveaux.
+REGLES ABSOLUES (POUR ASSURER LA RENTABILITE) :
+1. Ratio Risk/Reward MINIMUM 2:1.
+2. Si le contexte BTC est BAISSIER ou NEUTRE faible, tu DOIS rejeter (ATTENTE).
+3. RSI < 40 + MACD croisement haussier + Volume > 1.2 OBLIGATOIRES pour acheter.
+4. Un volume relatif < 1.0 ou une capitalisation incohérente -> ATTENTE.
+5. Calcule mentalement un 'Score de Validité' de 0 à 100. Si < 80, rejette.
+6. Ne tombe pas dans le piege des "pompes" : verifie les anomalies de volume et les futures.
+7. Pour le SL/TP, tu DOIS choisir EXACTEMENT l'option A ou B.
 
-Retourne EXACTEMENT ce JSON (rien avant ni apres) :
+Retourne UNIQUEMENT ce JSON valide (rien avant ni apres) :
 {
-    "reasoning": "Analyse: 1) Contexte BTC 2) Indicateurs 1H 3) Indicateurs 4H 4) Tendance 1D 5) News 6) Whales 7) Pourquoi pas un piege 8) Conclusion",
+    "reasoning": "Score interne: 85/100. Analyse: 1) Contexte BTC... 8) Conclusion",
     "signal": "ACHAT FORT",
-    "conviction_score": 75,
+    "conviction_score": 85,
     "allocation_pct": 30,
     "selected_option": "A",
     "take_profit_price": "0.0",
@@ -648,16 +646,16 @@ Retourne EXACTEMENT ce JSON (rien avant ni apres) :
     "risk_reward_ratio": "2.5:1"
 }
 Les valeurs de signal possibles sont exactement : "ACHAT FORT" | "ACHAT" | "ATTENTE" | "VENTE" | "VENTE FORTE"
-"selected_option" doit etre "A" (conservateur) ou "B" (agressif), correspondant aux niveaux pre-calcules fournis.
+"selected_option" doit etre "A" ou "B".
 """
 
 
-async def call_mistral_async(prompt):
-    client = Mistral(api_key=MISTRAL_API_KEY)
-    resp = await client.chat.complete_async(
-        model=MISTRAL_MODEL,
+async def call_ai_async(prompt):
+    client = AsyncGroq(api_key=GROQ_API_KEY)
+    resp = await client.chat.completions.create(
+        model=GROQ_MODEL,
         messages=[
-            {"role": "system", "content": MISTRAL_SYSTEM_V2},
+            {"role": "system", "content": AI_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ],
         temperature=0.15,
@@ -666,7 +664,7 @@ async def call_mistral_async(prompt):
     return json.loads(resp.choices[0].message.content.strip())
 
 
-async def analyze_with_mistral(tech, news, fng, market_intel, btc_context):
+async def analyze_with_ai(tech, news, fng, market_intel, btc_context):
     d1 = tech.get("1d", {})
     sym = tech["symbol"]
 
@@ -748,11 +746,11 @@ Considere notamment le funding rate et le long/short ratio comme signaux de posi
 Prix actuel = {tech['price']}. Si achat, selectionne l'Option A ou B ci-dessus pour tes niveaux SL/TP.
 """
     try:
-        res = await call_mistral_async(prompt)
+        res = await call_ai_async(prompt)
         res["conviction_score"] = int(res.get("conviction_score", 0))
         return res
     except Exception as e:
-        log.error(f"Mistral Error pour {sym}: {e}")
+        log.error(f"AI Error pour {sym}: {e}")
         return None
 
 
@@ -830,7 +828,7 @@ async def tech_loop():
                     log.info(f"Signal fort: {tech['symbol']} ({', '.join(reasons)})")
                     candidates.append(tech)
 
-            log.info(f"{len(candidates)}/{len(WATCHLIST)} cryptos avec signal fort -> Mistral")
+            log.info(f"{len(candidates)}/{len(WATCHLIST)} cryptos avec signal fort -> AI")
 
             candidate_symbols = [t["symbol"] for t in candidates]
             all_news = await get_all_news_parallel(candidate_symbols)
@@ -839,14 +837,14 @@ async def tech_loop():
                 sym = tech["symbol"]
                 try:
                     news = all_news.get(sym, [])
-                    analysis = await analyze_with_mistral(tech, news, fng, market_intel, btc_ctx)
+                    analysis = await analyze_with_ai(tech, news, fng, market_intel, btc_ctx)
                     if not analysis:
                         continue
 
                     score = analysis.get("conviction_score", 0)
                     sig = analysis.get("signal", "")
                     rr = analysis.get("risk_reward_ratio", "N/A")
-                    log.info(f"Mistral {sym}: {sig} ({score}/100) R/R:{rr}")
+                    log.info(f"AI {sym}: {sig} ({score}/100) R/R:{rr}")
 
                     last_analyses.insert(0, {
                         "symbol": sym,

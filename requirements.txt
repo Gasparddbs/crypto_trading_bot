@@ -12,12 +12,13 @@ ccxt>=4.4.0                  # Librairie API crypto avec support asynchrone
 pandas>=2.2.0                # Manipulation de données tabulaires
 ta>=0.11.0                   # Indicateurs techniques (RSI, EMA, MACD, etc.)
 
-# --- Intelligence Artificielle (Mistral) ---
-mistralai<2.0.0             # Client officiel Mistral AI (qui supporte l'async)
+# --- Intelligence Artificielle (Groq) ---
+groq>=0.9.0                  # Client Groq (très rapide)
 
 # --- Scraping & Actualités ---
 beautifulsoup4>=4.12.0       # Parsing HTML
 lxml>=5.0.0                  # Parser XML pour Google News RSS
+feedparser>=6.0.10           # Parser RSS robuste
 
 # --- Asynchrone (fichiers) ---
 aiofiles>=24.0.0              # I/O fichiers asynchrones

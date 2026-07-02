@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 # ou des requêtes HTTP aiohttp directes pour être purement async.
 # Pour la robustesse, on va faire des requêtes aiohttp directes à l'API Mistral.)
 # Alternativement, on peut utiliser le client synchrone dans to_thread.
-from mistralai.client import Mistral
+from mistralai import Mistral
 
 # ============================================================
 # CONFIGURATION

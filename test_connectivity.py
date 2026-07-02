@@ -39,7 +39,7 @@ def test_imports():
 
     # 4. mistralai
     try:
-        from mistralai.client import Mistral
+        from mistralai import Mistral
         tests.append(("mistralai", "✅ OK"))
     except ImportError as e:
         tests.append(("mistralai", f"❌ {e}"))
